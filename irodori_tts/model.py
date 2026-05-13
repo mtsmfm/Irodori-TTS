@@ -20,18 +20,29 @@ DURATION_ARCHITECTURES = {"pooled", "token_sum_adarn_zero_no_aux"}
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    # ONNX-friendly RoPE: returns a real-valued tensor of shape (end, dim/2, 2)
+    # where the last axis stores (cos, sin). Replaces the previous complex64
+    # representation so the model exports cleanly to ONNX (no view_as_complex).
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     t = torch.arange(end, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
-    return torch.complex(torch.cos(freqs), torch.sin(freqs))
+    return torch.stack((torch.cos(freqs), torch.sin(freqs)), dim=-1)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
-    # x: (B, S, H, Dh), Dh must be even.
-    x_ = torch.view_as_complex(x.float().reshape(*x.shape[:3], -1, 2))
-    x_ = x_ * freqs_cis[None, :, None, :]
-    x_ = torch.view_as_real(x_).reshape_as(x)
-    return x_.type_as(x)
+    # x: (B, S, H, Dh), Dh must be even. freqs_cis: (S, Dh/2, 2) with
+    # freqs_cis[..., 0] = cos, freqs_cis[..., 1] = sin.
+    x_dtype = x.dtype
+    x32 = x.float()
+    pair = x32.reshape(*x.shape[:3], -1, 2)
+    x_re = pair[..., 0]
+    x_im = pair[..., 1]
+    cos = freqs_cis[None, :, None, :, 0]
+    sin = freqs_cis[None, :, None, :, 1]
+    out_re = x_re * cos - x_im * sin
+    out_im = x_re * sin + x_im * cos
+    out = torch.stack((out_re, out_im), dim=-1).reshape_as(x32)
+    return out.to(x_dtype)
 
 
 def get_timestep_embedding(timestep: torch.Tensor, dim: int) -> torch.Tensor:
@@ -612,7 +623,7 @@ class TextEncoder(nn.Module):
         )
         self.head_dim = dim // heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 0, dtype=torch.float32), persistent=False
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -655,7 +666,7 @@ class ReferenceLatentEncoder(nn.Module):
         )
         self.head_dim = cfg.speaker_dim // cfg.speaker_heads
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 0, dtype=torch.float32), persistent=False
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
@@ -1179,7 +1190,7 @@ class TextToLatentRFDiT(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("model head_dim must be even for RoPE")
         self.register_buffer(
-            "_freqs_cis_cache", torch.empty(0, 0, dtype=torch.complex64), persistent=False
+            "_freqs_cis_cache", torch.empty(0, 0, 0, dtype=torch.float32), persistent=False
         )
 
     def _rope_freqs(self, seq_len: int, device: torch.device) -> torch.Tensor:
